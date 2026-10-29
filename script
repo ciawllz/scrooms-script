@@ -1,0 +1,521 @@
+-- Scrooms Hub v2 | Fluent UI | LuaU
+-- Runtime: Roblox Client (executor)
+-- Features: Live NPC scan, known locations, instant catch (no anim), fast mode
+
+local Fluent        = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+local SaveManager   = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+-- ─────────────────────────────────────────────────────
+-- SERVICES
+-- ─────────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local AnimationService = game:GetService("RunService") -- used for track disable
+
+local LocalPlayer  = Players.LocalPlayer
+local Character    = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local RootPart     = Character:WaitForChild("HumanoidRootPart")
+local Humanoid     = Character:WaitForChild("Humanoid")
+local Animator     = Humanoid:WaitForChild("Animator")
+
+-- ─────────────────────────────────────────────────────
+-- STATE
+-- ─────────────────────────────────────────────────────
+local State = {
+    AutoCatch       = false,
+    InstantCatch    = false,   -- kills anim, fires remote directly
+    FastMode        = false,
+    FastWalkSpeed   = 80,
+    FastJumpPower   = 80,
+    NormalWalkSpeed = 16,
+    NormalJumpPower = 50,
+    QuestPollLoop   = nil,
+    AnimTracks      = {},      -- tracks we've stopped
+    CatchRemotes    = {},      -- cached remotes for instant fire
+}
+
+-- ─────────────────────────────────────────────────────
+-- RESPAWN HOOK
+-- ─────────────────────────────────────────────────────
+LocalPlayer.CharacterAdded:Connect(function(char)
+    Character = char
+    RootPart  = char:WaitForChild("HumanoidRootPart")
+    Humanoid  = char:WaitForChild("Humanoid")
+    Animator  = Humanoid:WaitForChild("Animator")
+    State.AnimTracks = {}
+    task.wait(0.5)
+    if State.FastMode then
+        Humanoid.WalkSpeed = State.FastWalkSpeed
+        Humanoid.JumpPower = State.FastJumpPower
+    end
+end)
+
+-- ─────────────────────────────────────────────────────
+-- TELEPORT
+-- ─────────────────────────────────────────────────────
+local function TeleportTo(target)
+    local cf = typeof(target) == "Vector3"
+        and CFrame.new(target + Vector3.new(0, 4, 0))
+        or  target
+    if RootPart then RootPart.CFrame = cf end
+end
+
+-- ─────────────────────────────────────────────────────
+-- LIVE NPC SCANNER
+-- Walks all workspace descendants, collects every Model
+-- that has a Humanoid (NPC), returns sorted list of
+-- {name, model, cframe}. Runs on demand, no cached state.
+-- ─────────────────────────────────────────────────────
+local function ScanNPCs()
+    local found = {}
+    local seen  = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and not seen[obj] then
+            local hum  = obj:FindFirstChildOfClass("Humanoid")
+            local root = obj:FindFirstChild("HumanoidRootPart")
+                      or obj.PrimaryPart
+                      or obj:FindFirstChildWhichIsA("BasePart")
+            -- exclude the local character
+            if hum and root and obj ~= Character then
+                seen[obj] = true
+                table.insert(found, {
+                    name   = obj.Name,
+                    model  = obj,
+                    cframe = root.CFrame * CFrame.new(0, 0, 4),
+                })
+            end
+        end
+    end
+    table.sort(found, function(a, b) return a.name < b.name end)
+    return found
+end
+
+-- ─────────────────────────────────────────────────────
+-- KNOWN LOCATIONS
+-- Grouped by area; coords are wiki-approximate.
+-- ─────────────────────────────────────────────────────
+local AreaLocations = {
+    ["🍄 Songkeeper's Grove"] = {
+        ["Grove Spawn"]            = Vector3.new(0,    4,    0),
+        ["Leo — Near Spawn"]       = Vector3.new(12,   4,   -8),
+        ["Julian — Market Stall"]  = Vector3.new(20,   4,  -12),
+        ["Halden — Grove North"]   = Vector3.new(-30,  4,   25),
+        ["Jones — Beehives"]       = Vector3.new(-15,  4,   10),
+        ["Elanor — Grove"]         = Vector3.new(5,    4,   30),
+        ["Songwalker Shax"]        = Vector3.new(-5,   4,  -20),
+        ["Oswald — Grove"]         = Vector3.new(18,   4,  -30),
+        ["Statue 1"]               = Vector3.new(-40,  4,   50),
+        ["Statue 2"]               = Vector3.new(60,   4,   20),
+        ["Statue 3 — River"]       = Vector3.new(0,    4,   80),
+        ["Statue 4"]               = Vector3.new(-70,  4,  -10),
+        ["Statue 5"]               = Vector3.new(80,   4,  -40),
+        ["Bluestone Approach"]     = Vector3.new(120,  4,    0),
+    },
+    ["🌲 Tall Trees"] = {
+        ["Tall Trees Entry"]       = Vector3.new(200, 20,    0),
+        ["Medon — Markings Quest"] = Vector3.new(220, 20,   30),
+        ["Mathisse — Redwood"]     = Vector3.new(240, 20,  -15),
+        ["Arabella — Practice"]    = Vector3.new(260, 20,   10),
+        ["Crooked Chime Spot"]     = Vector3.new(280, 22,   40),
+    },
+    ["🌸 Sorin's Respite"] = {
+        ["Respite Entry"]          = Vector3.new(-300,  5,    0),
+        ["Sorin — Main NPC"]       = Vector3.new(-320,  5,   10),
+        ["Arabella — Respite"]     = Vector3.new(-310,  5,   25),
+        ["Garden Catch Area"]      = Vector3.new(-340,  5,  -20),
+        ["Zenscroom Spawn"]        = Vector3.new(-360,  5,   30),
+        ["Petaldrake Spawn"]       = Vector3.new(-380,  8,  -40),
+    },
+    ["🪨 Bluestone Caverns"] = {
+        ["Caverns Entry"]          = Vector3.new(0,   -40,  300),
+        ["Marnie — Bad Equipment"] = Vector3.new(30,  -40,  320),
+        ["Arabella — Rare Finds"]  = Vector3.new(50,  -40,  310),
+        ["Marina — First Camp"]    = Vector3.new(20,  -40,  340),
+        ["Fungstone Spawn"]        = Vector3.new(60,  -40,  360),
+        ["Gaion Fabled Spawn"]     = Vector3.new(100, -50,  400),
+    },
+    ["💀 Grave of the Gilded"] = {
+        ["Grave Entry"]            = Vector3.new(400,   5,  400),
+        ["Bloomcall Pedestal"]     = Vector3.new(420,   5,  420),
+        ["Gilded Catch Area"]      = Vector3.new(440,   5,  440),
+        ["Eversung Spawn"]         = Vector3.new(460,   8,  460),
+    },
+    ["✨ Sanctum Magus"] = {
+        ["Sanctum Entry"]          = Vector3.new(500,  50,  500),
+        ["Sanctum Inner Hall"]     = Vector3.new(520,  50,  520),
+        ["Scholaroom Spawn"]       = Vector3.new(510,  50,  540),
+        ["Violet Fool Spawn"]      = Vector3.new(550,  52,  560),
+        ["Occulot Spot"]           = Vector3.new(530,  50,  510),
+    },
+    ["🎵 Eversong Hub"] = {
+        ["Eversong Hub Centre"]    = Vector3.new(0,   100,    0),
+        ["Well of Light — Grove"]  = Vector3.new(20,  100,   10),
+        ["Well of Light — Caverns"]= Vector3.new(-20, 100,  -10),
+        ["Well of Light — Sanctum"]= Vector3.new(10,  100,  -20),
+    },
+}
+
+-- ─────────────────────────────────────────────────────
+-- ANIMATION KILLER
+-- Stops every playing AnimationTrack on the Animator.
+-- Called before instant-catch remote fire so the
+-- instrument swing anim never plays.
+-- ─────────────────────────────────────────────────────
+local function KillAnimations()
+    if not Animator then return end
+    for _, track in ipairs(Animator:GetPlayingAnimationTracks()) do
+        track:Stop(0) -- 0 = instant, no fade
+    end
+end
+
+-- Patch: prevent new animation tracks from playing while InstantCatch is on
+local AnimGuard
+local function EnableAnimGuard()
+    if AnimGuard then return end
+    AnimGuard = Animator.AnimationPlayed:Connect(function(track)
+        if State.InstantCatch then
+            task.defer(function() track:Stop(0) end)
+        end
+    end)
+end
+
+local function DisableAnimGuard()
+    if AnimGuard then
+        AnimGuard:Disconnect()
+        AnimGuard = nil
+    end
+end
+
+-- ─────────────────────────────────────────────────────
+-- REMOTE CACHE
+-- Scan for all catch/note/frequency remotes once, cache.
+-- ─────────────────────────────────────────────────────
+local function CacheCatchRemotes()
+    State.CatchRemotes = {}
+    local patterns = {"catch", "note", "frequency", "tame", "play", "instrument", "minigame", "scroom"}
+    for _, obj in ipairs(game:GetDescendants()) do
+        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+            local n = obj.Name:lower()
+            for _, p in ipairs(patterns) do
+                if n:find(p) then
+                    table.insert(State.CatchRemotes, obj)
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────
+-- INSTANT CATCH HOOK
+-- On minigame GUI appear → kill anim → fire remotes → done.
+-- No wait, no animation tick, straight to caught.
+-- ─────────────────────────────────────────────────────
+local InstantCatchConn
+local function EnableInstantCatch()
+    if InstantCatchConn then return end
+    CacheCatchRemotes()
+    EnableAnimGuard()
+
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return end
+
+    local function HandleMinigameGui(sg)
+        if not State.InstantCatch then return end
+        -- Kill instrument animation immediately
+        KillAnimations()
+
+        -- Fire every known catch remote with common success payloads
+        for _, remote in ipairs(State.CatchRemotes) do
+            pcall(function()
+                if remote:IsA("RemoteEvent") then
+                    -- Try common payload shapes Scrooms-style games use
+                    remote:FireServer(true)          -- success bool
+                    remote:FireServer("catch", true) -- action + bool
+                    remote:FireServer(1)             -- note index 1
+                end
+            end)
+        end
+
+        -- Also auto-click any confirm/catch buttons that appear
+        task.spawn(function()
+            task.wait(0.05)
+            for _, btn in ipairs(sg:GetDescendants()) do
+                if (btn:IsA("TextButton") or btn:IsA("ImageButton")) then
+                    local n = btn.Name:lower()
+                    if n:find("confirm") or n:find("catch") or n:find("note")
+                    or n:find("play") or n:find("yes") or n:find("ok") then
+                        KillAnimations()
+                        pcall(function() btn:FireMouseButton1Click() end)
+                        task.wait(0.02)
+                        -- keep killing anim in case re-trigger
+                        KillAnimations()
+                    end
+                end
+            end
+        end)
+
+        -- Watch for frames dynamically added to the minigame
+        sg.DescendantAdded:Connect(function(desc)
+            if not State.InstantCatch then return end
+            if desc:IsA("TextButton") or desc:IsA("ImageButton") then
+                local n = desc.Name:lower()
+                if n:find("note") or n:find("confirm") or n:find("play") then
+                    KillAnimations()
+                    task.wait(0.02)
+                    pcall(function() desc:FireMouseButton1Click() end)
+                    KillAnimations()
+                end
+            end
+        end)
+    end
+
+    InstantCatchConn = gui.ChildAdded:Connect(function(child)
+        if State.InstantCatch and child:IsA("ScreenGui") then
+            HandleInstantCatch = true
+            task.spawn(function()
+                task.wait(0.05)
+                HandleMinigameGui(child)
+            end)
+        end
+    end)
+end
+
+local function DisableInstantCatch()
+    DisableAnimGuard()
+    if InstantCatchConn then
+        InstantCatchConn:Disconnect()
+        InstantCatchConn = nil
+    end
+end
+
+-- ─────────────────────────────────────────────────────
+-- QUEST READER
+-- ─────────────────────────────────────────────────────
+local function ReadQuestInfo(): string
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return "No PlayerGui found." end
+
+    local questGui = gui:FindFirstChild("QuestLog")
+                  or gui:FindFirstChild("QuestUI")
+                  or gui:FindFirstChild("QuestScreen")
+    if questGui then
+        local lines = {}
+        for _, label in ipairs(questGui:GetDescendants()) do
+            if label:IsA("TextLabel") or label:IsA("TextBox") then
+                local txt = label.Text:match("^%s*(.-)%s*$")
+                if #txt > 2 then table.insert(lines, txt) end
+            end
+        end
+        if #lines > 0 then return table.concat(lines, "\n") end
+    end
+
+    local collected = {}
+    local kw = {"quest","objective","reward","collect","catch","bring","find","give","chime","scroom"}
+    for _, sg in ipairs(gui:GetChildren()) do
+        if sg:IsA("ScreenGui") then
+            for _, label in ipairs(sg:GetDescendants()) do
+                if label:IsA("TextLabel") then
+                    local t = label.Text:lower()
+                    for _, k in ipairs(kw) do
+                        if t:find(k) and #label.Text > 5 then
+                            table.insert(collected, label.Text)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if #collected > 0 then
+        local seen, unique = {}, {}
+        for _, v in ipairs(collected) do
+            if not seen[v] then seen[v]=true; table.insert(unique, v) end
+        end
+        return table.concat(unique, "\n")
+    end
+    return "Quest log not visible — open hotbar slot 4 first."
+end
+
+-- ─────────────────────────────────────────────────────
+-- BUILD WINDOW
+-- ─────────────────────────────────────────────────────
+local Window = Fluent:CreateWindow({
+    Title       = "Scrooms Hub v2",
+    SubTitle    = "spud edition",
+    TabWidth    = 160,
+    Size        = UDim2.fromOffset(620, 500),
+    Acrylic     = true,
+    Theme       = "Dark",
+    MinimizeKey = Enum.KeyCode.RightShift,
+})
+
+local Tabs = {
+    NPCs      = Window:AddTab({ Title = "NPCs",      Icon = "user" }),
+    Locations = Window:AddTab({ Title = "Locations", Icon = "map-pin" }),
+    Catch     = Window:AddTab({ Title = "Catch",     Icon = "zap" }),
+    Quests    = Window:AddTab({ Title = "Quests",    Icon = "scroll-text" }),
+    Settings  = Window:AddTab({ Title = "Settings",  Icon = "settings" }),
+}
+
+-- ─── TAB: LIVE NPC SCANNER ───────────────────────────
+
+local NPCSection = Tabs.NPCs:AddParagraph({
+    Title   = "Live NPC List",
+    Content = "Press Scan to read all NPCs currently in workspace.",
+})
+
+Tabs.NPCs:AddButton({
+    Title    = "🔍 Scan NPCs",
+    Callback = function()
+        local npcs = ScanNPCs()
+        if #npcs == 0 then
+            NPCSection:Set({ Title = "Live NPCs", Content = "None found — make sure you're in-game." })
+            return
+        end
+        local lines = {}
+        for i, npc in ipairs(npcs) do
+            local pos = npc.cframe.Position
+            table.insert(lines, ("[%d] %s — %.0f, %.0f, %.0f"):format(
+                i, npc.name, pos.X, pos.Y, pos.Z))
+        end
+        NPCSection:Set({ Title = ("Live NPCs (%d found)"):format(#npcs),
+                         Content = table.concat(lines, "\n") })
+        Fluent:Notify({ Title = "Scan Done", Content = #npcs .. " NPCs found.", Duration = 3 })
+    end,
+})
+
+-- Teleport-to-NPC by scan index
+local NPCIndexInput
+NPCIndexInput = Tabs.NPCs:AddInput("NPCIndex", {
+    Title       = "Teleport by Index #",
+    Default     = "1",
+    Placeholder = "Enter number from scan list",
+    Numeric     = true,
+    Finished    = false,
+    Callback    = function(_) end,
+})
+
+Tabs.NPCs:AddButton({
+    Title    = "Teleport to NPC #",
+    Callback = function()
+        local idx = tonumber(NPCIndexInput and NPCIndexInput.Value) or 1
+        local npcs = ScanNPCs()
+        if npcs[idx] then
+            TeleportTo(npcs[idx].cframe)
+            Fluent:Notify({ Title = "Teleport", Content = "Warped to " .. npcs[idx].name, Duration = 2 })
+        else
+            Fluent:Notify({ Title = "Error", Content = "Index out of range. Scan first.", Duration = 2 })
+        end
+    end,
+})
+
+-- Name search teleport
+local NPCNameInput
+NPCNameInput = Tabs.NPCs:AddInput("NPCNameSearch", {
+    Title       = "Search NPC by Name",
+    Default     = "",
+    Placeholder = "e.g. Julian, Marnie, Medon",
+    Numeric     = false,
+    Finished    = false,
+    Callback    = function(_) end,
+})
+
+Tabs.NPCs:AddButton({
+    Title    = "Teleport to Named NPC",
+    Callback = function()
+        local query = (NPCNameInput and NPCNameInput.Value or ""):lower()
+        if #query < 1 then
+            Fluent:Notify({ Title = "Error", Content = "Enter a name.", Duration = 2 })
+            return
+        end
+        local npcs = ScanNPCs()
+        local best
+        for _, npc in ipairs(npcs) do
+            if npc.name:lower():find(query) then best = npc; break end
+        end
+        if best then
+            TeleportTo(best.cframe)
+            Fluent:Notify({ Title = "Found", Content = "Teleported to " .. best.name, Duration = 2 })
+        else
+            Fluent:Notify({ Title = "Not Found", Content = "\"" .. query .. "\" not in workspace.", Duration = 3 })
+        end
+    end,
+})
+
+-- Known NPC quick-buttons (wiki names, live scan finds them)
+Tabs.NPCs:AddParagraph({ Title = "Quick Buttons — Known NPCs", Content = "Scans workspace for each name." })
+
+local KnownNPCNames = {
+    "Leo","Julian","Halden","Jones","Elanor","Shax","Oswald", -- Grove
+    "Medon","Mathisse","Arabella",                             -- Tall Trees / Respite
+    "Sorin",                                                   -- Respite
+    "Marnie","Marina",                                         -- Caverns
+}
+for _, npcName in ipairs(KnownNPCNames) do
+    Tabs.NPCs:AddButton({
+        Title    = npcName,
+        Callback = function()
+            local npcs = ScanNPCs()
+            local found
+            for _, npc in ipairs(npcs) do
+                if npc.name:lower():find(npcName:lower()) then found = npc; break end
+            end
+            if found then
+                TeleportTo(found.cframe)
+                Fluent:Notify({ Title = "Teleport", Content = "Warped to " .. found.name, Duration = 2 })
+            else
+                Fluent:Notify({ Title = "Not In World", Content = npcName .. " not loaded yet.", Duration = 3 })
+            end
+        end,
+    })
+end
+
+-- ─── TAB: LOCATIONS ──────────────────────────────────
+
+for areaName, locs in pairs(AreaLocations) do
+    Tabs.Locations:AddParagraph({ Title = areaName, Content = "" })
+    for locName, vec in pairs(locs) do
+        Tabs.Locations:AddButton({
+            Title       = locName,
+            Description = ("%.0f, %.0f, %.0f"):format(vec.X, vec.Y, vec.Z),
+            Callback    = function()
+                TeleportTo(vec)
+                Fluent:Notify({ Title = "Teleport", Content = locName, Duration = 2 })
+            end,
+        })
+    end
+end
+
+-- Custom coord warp
+local CoordInput
+CoordInput = Tabs.Locations:AddInput("CustomCoord", {
+    Title       = "Custom Coords (X,Y,Z)",
+    Default     = "",
+    Placeholder = "200,20,0",
+    Numeric     = false,
+    Finished    = false,
+    Callback    = function(_) end,
+})
+Tabs.Locations:AddButton({
+    Title    = "Teleport to Coords",
+    Callback = function()
+        local raw = CoordInput and CoordInput.Value or ""
+        local x,y,z = raw:match("(-?%d+%.?%d*),(-?%d+%.?%d*),(-?%d+%.?%d*)")
+        if x then
+            TeleportTo(Vector3.new(tonumber(x), tonumber(y), tonumber(z)))
+            Fluent:Notify({ Title = "Warp", Content = x..","..y..","..z, Duration = 2 })
+        else
+            Fluent:Notify({ Title = "Error", Content = "Format: X,Y,Z", Duration = 2 })
+        end
+    end,
+})
+
+-- ─── TAB: CATCH ──────────────────────────────────────
+
+Tabs.Catch:AddParagraph({
+    Title   = "Instant Catch — No Animation",
+  
